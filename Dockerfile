@@ -10,8 +10,4 @@ COPY . .
 
 RUN playwright install chromium
 
-RUN chmod +x /app/entrypoint.sh
-
-EXPOSE 8000
-
-CMD ["/app/entrypoint.sh"]
+CMD ["python", "main.py"]

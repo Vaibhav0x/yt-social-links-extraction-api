@@ -392,3 +392,11 @@ async def scrape_bulk(body: BulkScrapeRequest):
         succeeded=succeeded,
         failed=len(results) - succeeded,
     )
+
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
