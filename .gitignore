@@ -1,0 +1,40 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+
+# Environment variables file
+.env
+.env.*
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+.pytest_cache/
+coverage.xml
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS generated files
+.DS_Store
+
+# Railway configuration (optional)
+railway.json
+
+# Logs
+*.log
