@@ -1,7 +1,13 @@
 #!/bin/bash
-set -e
 
+# Set default port if not provided
 PORT=${PORT:-8000}
-echo "Starting uvicorn on port $PORT"
 
-exec uvicorn main:app --host 0.0.0.0 --port $PORT
+# Debug output
+echo "=== Starting Scrapping Service ==="
+echo "PORT: $PORT"
+echo "HOST: 0.0.0.0"
+echo "==============================="
+
+# Start uvicorn
+exec uvicorn main:app --host 0.0.0.0 --port "$PORT"
