@@ -18,7 +18,7 @@ import re
 import asyncio
 from urllib.parse import urlparse, unquote, parse_qs
 from contextlib import asynccontextmanager
-from typing import Optional, List, Tuple, Set
+from typing import Optional, List, Tuple, Set, Dict
 import html
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +29,13 @@ from playwright.async_api import (
     BrowserContext,
     TimeoutError as PlaywrightTimeout,
 )
+from run_pipeline import run_pipeline
+import json
+import os
+
+
+EMAIL_FILE = "shows_with_email.txt"
+SHOWS_FILE = "shows.txt"
 
 # ─────────────────────────────────────────────
 # CONSTANTS
@@ -144,7 +151,28 @@ class BulkScrapeResponse(BaseModel):
     succeeded: int
     failed: int
 
+class PodcastListingScrapeRequest(BaseModel):
+    website_url: str = Field(
+        ...,
+        description="URL of podcast listing website (e.g. millionpodcasts.com)"
+    )
 
+class PodcastListingItem(BaseModel):
+    title: str
+    url: Optional[str] = None
+    description: Optional[str] = None
+    host: Optional[str] = None
+    image: Optional[str] = None
+    website: Optional[str] = None
+    spotify: Optional[str] = None
+    apple: Optional[str] = None
+    youtube: Optional[str] = None
+    email: Optional[str] = None
+
+class PodcastListingScrapeResponse(BaseModel):
+    podcasts: List[PodcastListingItem]
+    total_found: int
+    error: Optional[str] = None
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
@@ -356,9 +384,30 @@ async def scrape_channel(handle_or_url: str) -> ScrapeResponse:
 
 
 # ─────────────────────────────────────────────
-# ROUTES
+# PODCAST LISTING SCRAPER
 # ─────────────────────────────────────────────
 
+
+def load_email_results():
+    """Load podcast results with emails from file."""
+    podcasts = []
+
+    if not os.path.exists(EMAIL_FILE):
+        return podcasts
+
+    with open(EMAIL_FILE) as f:
+        for line in f:
+            try:
+                podcasts.append(json.loads(line))
+            except:
+                pass
+
+    return podcasts
+
+
+# ─────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -393,6 +442,288 @@ async def scrape_bulk(body: BulkScrapeRequest):
         failed=len(results) - succeeded,
     )
 
+
+# ─────────────────────────────────────────────
+# PODCAST LISTING SCRAPER
+# ─────────────────────────────────────────────
+
+
+async def scrape_podcast_listings(website_url: str) -> PodcastListingScrapeResponse:
+    """
+    Scrape podcast listings from websites like millionpodcasts.com using Playwright.
+    Handles JavaScript-rendered content.
+    """
+    result = PodcastListingScrapeResponse(
+        website_url=website_url,
+        podcasts=[],
+        total_found=0,
+        error=None,
+    )
+
+    if browser is None:
+        result.error = "Browser not initialized"
+        return result
+
+    context: BrowserContext = await browser.new_context(
+        user_agent=USER_AGENT,
+        locale="en-US",
+        viewport={"width": 1280, "height": 800},
+    )
+
+    try:
+        page = await context.new_page()
+
+        # Block images/fonts for faster loading
+        await page.route(
+            "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}",
+            lambda route: route.abort(),
+        )
+
+        print(f"🌐 Fetching podcast listings from: {website_url}")
+        
+        # Navigate to website - use domcontentloaded for speed (faster than networkidle)
+        await page.goto(website_url, wait_until="domcontentloaded", timeout=25000)
+        
+        # Wait a bit for JavaScript to render (shorter than networkidle)
+        await asyncio.sleep(1)
+
+        # Handle consent dialogs (common on listing sites)
+        try:
+            await page.click('button:has-text("Accept"), button:has-text("Accept all"), [aria-label*="Accept"]', timeout=3000)
+            await asyncio.sleep(1)
+        except Exception:
+            pass
+
+        # Scroll to trigger lazy loading
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(1)  # Reduced from 2 seconds for speed
+
+        podcasts: List[PodcastListingItem] = []
+        seen_urls = set()
+
+        # Strategy 1: Look for podcast/show cards (most common on listing sites)
+        card_selectors = [
+            'article',
+            'div[class*="podcast"]',
+            'div[class*="show"]',
+            'div[class*="card"]',
+            'div[class*="item"]',
+            'li[class*="podcast"]',
+            'li[class*="show"]',
+            '[class*="listing"]',
+        ]
+
+        print(f"  🔍 Searching for podcast cards...")
+        
+        # Try each selector
+        for selector in card_selectors:
+            try:
+                # Count matching elements
+                count = await page.locator(selector).count()
+                
+                if count > 2:  # Only use if we found multiple cards
+                    print(f"  ✅ Found {count} items using: {selector}")
+                    
+                    # Extract all podcast data in one JavaScript batch (much faster)
+                    max_cards = min(count, 50)  # Limit to 50 for speed
+                    
+                    extracted_data = await page.evaluate(f"""
+                    (async () => {{
+                        const selector = "{selector}";
+                        const cards = document.querySelectorAll(selector);
+                        const results = [];
+                        
+                        for (let i = 0; i < Math.min(cards.length, {max_cards}); i++) {{
+                            const card = cards[i];
+                            
+                            // Extract title
+                            const titleElem = card.querySelector('a, h1, h2, h3, h4, .title, [class*="title"]');
+                            let title = titleElem?.textContent?.trim() || '';
+                            title = title.slice(0, 200);
+                            
+                            if (!title || title.length < 2) continue;
+                            
+                            // Extract URL
+                            const linkElem = card.querySelector('a[href]');
+                            let url = linkElem?.href || '';
+                            
+                            if (!url) continue;
+                            
+                            // Extract description
+                            const descElem = card.querySelector('p, [class*="description"], [class*="desc"]');
+                            let description = descElem?.textContent?.trim() || null;
+                            if (description) description = description.slice(0, 500);
+                            
+                            // Extract host
+                            const hostElem = card.querySelector('[class*="host"], [class*="author"], [class*="creator"]');
+                            let host = hostElem?.textContent?.trim() || null;
+                            
+                            // Extract image
+                            const imgElem = card.querySelector('img');
+                            let image_url = imgElem?.src || null;
+                            
+                            results.push({{ title, url, description, host, image_url }});
+                        }}
+                        
+                        return results;
+                    }})()
+                    """)
+                    
+                    # Process results
+                    for item in extracted_data:
+                        try:
+                            title = item.get('title', '').strip()
+                            url = item.get('url', '').strip()
+                            description = item.get('description')
+                            host = item.get('host')
+                            image_url = item.get('image_url')
+                            
+                            if not title or not url:
+                                continue
+                            
+                            # Make URL absolute if relative
+                            if url.startswith('/'):
+                                base_url = urlparse(website_url).scheme + '://' + urlparse(website_url).netloc
+                                url = base_url + url
+                            elif not url.startswith('http'):
+                                url = website_url.rstrip('/') + '/' + url
+                            
+                            # Avoid duplicates
+                            if url in seen_urls:
+                                continue
+                            seen_urls.add(url)
+                            
+                            # Make image URL absolute if needed
+                            if image_url and image_url.startswith('/'):
+                                base_url = urlparse(website_url).scheme + '://' + urlparse(website_url).netloc
+                                image_url = base_url + image_url
+                            
+                            podcast = PodcastListingItem(
+                                title=title,
+                                url=url,
+                                description=description,
+                                host=host,
+                                image_url=image_url,
+                            )
+                            podcasts.append(podcast)
+                            
+                        except Exception as e:
+                            print(f"    ⚠️  Error processing item: {str(e)[:50]}")
+                            continue
+                    
+                    if podcasts:
+                        break  # Found valid podcasts with this selector
+                        
+            except Exception as e:
+                print(f"    ⚠️  Selector error ({selector}): {str(e)[:50]}")
+                continue
+
+        # Strategy 2: Fallback to extracting all links on page
+        if not podcasts:
+            print(f"  ⚠️  No cards found, falling back to link extraction...")
+            try:
+                # Use JavaScript to extract all links at once (faster)
+                links_data = await page.evaluate("""
+                () => {
+                    const links = document.querySelectorAll('a[href]');
+                    const results = [];
+                    
+                    for (let i = 0; i < Math.min(links.length, 50); i++) {
+                        const link = links[i];
+                        let title = link.textContent?.trim() || '';
+                        let url = link.href || '';
+                        
+                        if (!title || title.length < 2 || title.length > 200) continue;
+                        if (!url || url.startsWith('#')) continue;
+                        
+                        // Skip navigation
+                        if (['search', 'filter', 'category', 'tag', 'page='].some(s => url.toLowerCase().includes(s))) continue;
+                        
+                        results.push({ title, url });
+                    }
+                    
+                    return results;
+                }
+                """)
+                
+                for item in links_data:
+                    try:
+                        url = item.get('url', '').strip()
+                        title = item.get('title', '').strip()
+                        
+                        # Avoid duplicates
+                        if url in seen_urls:
+                            continue
+                        seen_urls.add(url)
+                        
+                        podcast = PodcastListingItem(
+                            title=title,
+                            url=url,
+                        )
+                        podcasts.append(podcast)
+                    except Exception:
+                        continue
+                        
+            except Exception as e:
+                print(f"    ⚠️  Fallback extraction error: {str(e)[:50]}")
+
+        result.podcasts = podcasts[:100]  # Limit to 100 podcasts
+        result.total_found = len(podcasts)
+        print(f"  ✅ Extracted {len(podcasts)} podcasts")
+
+    except PlaywrightTimeout:
+        result.error = f"Timeout loading {website_url}"
+        print(f"  ❌ Timeout: {result.error}")
+    except Exception as e:
+        result.error = f"Scraping error: {str(e)}"
+        print(f"  ❌ Error: {result.error}")
+    finally:
+        await context.close()
+
+    return result
+
+
+@app.post("/scrape/podcast-listings")
+async def scrape_podcast_listings_endpoint(body: PodcastListingScrapeRequest):
+    """Scrape podcast listings - run pipeline completely, then return all results."""
+    website_url = body.website_url
+    
+    try:
+        print(f"\n🚀 Starting pipeline for {website_url}")
+        
+        # Run the COMPLETE pipeline (synchronously, blocking)
+        await run_pipeline(website_url)
+        
+        print(f"✅ Pipeline complete! Reading results...")
+        
+        # Load ALL results from email file
+        results = load_email_results()
+        
+        # Ensure all items are valid PodcastListingItem objects
+        valid_podcasts = []
+        for item in results:
+            try:
+                podcast = PodcastListingItem(**item) if isinstance(item, dict) else item
+                valid_podcasts.append(podcast)
+            except Exception as e:
+                print(f"  ⚠️  Skipping invalid item: {str(e)[:50]}")
+                continue
+        
+        print(f"📊 Total shows with emails: {len(valid_podcasts)}")
+        
+        return PodcastListingScrapeResponse(
+            podcasts=valid_podcasts,
+            total_found=len(valid_podcasts),
+            error=None
+        )
+        
+    except Exception as e:
+        print(f"❌ Error in scraping pipeline: {str(e)}")
+        return PodcastListingScrapeResponse(
+            podcasts=[],
+            total_found=0,
+            error=str(e)
+        )
 
 if __name__ == "__main__":
     import os
